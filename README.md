@@ -1,6 +1,5 @@
 # Schema Documentation Generator
-
-This tool automatically generates comprehensive database schema documentation from your Supabase project. It creates three types of documentation files:
+Fetch your database schema information from your Supebase project in a second. This tool automatically generates comprehensive database schema documentation. It creates three types of documentation files:
 
 1. `schema_info.json` - Raw schema data in JSON format
 2. `schema_docs.md` - Human-readable documentation in Markdown
@@ -191,7 +190,7 @@ Run the documentation generator:
 ```bash
 npm run fetch-schema
 ```
-
+Create a new Directory 'Documentation' in your root project file.
 This will create/update three files in the `Documentations` directory:
 - `schema_info.json`: Raw schema data
 - `schema_docs.md`: Markdown documentation
