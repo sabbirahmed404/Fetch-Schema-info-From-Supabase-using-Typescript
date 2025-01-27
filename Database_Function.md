@@ -1,5 +1,5 @@
 
-# Run this function in your Database 
+# Run Database_Function.sql in your Supabase SQL Editor 
 
 ## Overview Functions
 
