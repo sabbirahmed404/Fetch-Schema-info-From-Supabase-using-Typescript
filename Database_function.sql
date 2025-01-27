@@ -1,143 +1,207 @@
-CREATE OR REPLACE FUNCTION get_schema_info()
-RETURNS JSONB
-LANGUAGE plpgsql
+-- Drop existing functions to ensure clean recreation
+DROP FUNCTION IF EXISTS public.get_schema_info();
+DROP FUNCTION IF EXISTS public.get_tables();
+DROP FUNCTION IF EXISTS public.get_functions();
+
+-- Function to get all functions in the database
+CREATE OR REPLACE FUNCTION public.get_functions()
+RETURNS TABLE (
+    function_name text,
+    language text,
+    return_type text,
+    argument_types text,
+    definition text,
+    description text
+)
+LANGUAGE sql
+SECURITY DEFINER
 AS $$
-DECLARE
-    result JSONB;
-BEGIN
-    WITH table_info AS (
-        SELECT 
-            t.table_name,
-            jsonb_agg(
-                jsonb_build_object(
-                    'column_name', c.column_name,
-                    'data_type', c.data_type,
-                    'is_nullable', c.is_nullable,
-                    'column_default', c.column_default,
-                    'description', col_description((t.table_schema || '.' || t.table_name)::regclass, c.ordinal_position)
-                )
-            ) AS columns,
-            (
-                SELECT jsonb_agg(
-                    jsonb_build_object(
-                        'column_name', kcu.column_name,
-                        'foreign_table_name', ccu.table_name,
-                        'foreign_column_name', ccu.column_name,
-                        'constraint_name', tc.constraint_name
-                    )
-                )
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu 
-                    ON tc.constraint_name = kcu.constraint_name
-                JOIN information_schema.constraint_column_usage ccu
-                    ON ccu.constraint_name = tc.constraint_name
-                WHERE tc.constraint_type = 'FOREIGN KEY'
-                AND tc.table_name = t.table_name
-                AND tc.table_schema = t.table_schema
-            ) AS foreign_keys,
-            (
-                SELECT jsonb_agg(
-                    jsonb_build_object(
-                        'constraint_name', tc.constraint_name,
-                        'constraint_type', tc.constraint_type,
-                        'column_names', (
-                            SELECT jsonb_agg(kcu.column_name)
-                            FROM information_schema.key_column_usage kcu
-                            WHERE kcu.constraint_name = tc.constraint_name
-                        ),
-                        'definition', pg_get_constraintdef(pgc.oid)
-                    )
-                )
-                FROM information_schema.table_constraints tc
-                JOIN pg_constraint pgc ON tc.constraint_name = pgc.conname
-                WHERE tc.table_name = t.table_name
-                AND tc.table_schema = t.table_schema
-            ) AS constraints,
-            (
-                SELECT jsonb_agg(
-                    jsonb_build_object(
-                        'indexname', indexname,
-                        'indexdef', indexdef
-                    )
-                )
-                FROM pg_indexes
-                WHERE schemaname = t.table_schema AND tablename = t.table_name
-            ) AS indexes,
-            (
-                SELECT jsonb_agg(
-                    jsonb_build_object(
-                        'trigger_name', tg.trigger_name,
-                        'event_manipulation', tg.event_manipulation,
-                        'action_timing', tg.action_timing,
-                        'action_statement', tg.action_statement,
-                        'function_definition', pg_get_functiondef(p.oid)
-                    )
-                )
-                FROM information_schema.triggers tg
-                JOIN pg_trigger pgt ON tg.trigger_name = pgt.tgname
-                JOIN pg_proc p ON pgt.tgfoid = p.oid
-                WHERE tg.event_object_schema = t.table_schema
-                AND tg.event_object_table = t.table_name
-            ) AS triggers,
-            (
-                SELECT jsonb_agg(
-                    jsonb_build_object(
-                        'policyname', policyname,
-                        'tablename', tablename,
-                        'command', cmd,
-                        'permissive', permissive,
-                        'roles', roles,
-                        'using', qual,
-                        'with_check', with_check
-                    )
-                )
-                FROM pg_policies
-                WHERE schemaname = t.table_schema AND tablename = t.table_name
-            ) AS policies
-        FROM information_schema.tables t
-        JOIN information_schema.columns c 
-            ON c.table_name = t.table_name 
-            AND c.table_schema = t.table_schema
-        WHERE t.table_schema = 'public'
-        AND t.table_type = 'BASE TABLE'
-        GROUP BY t.table_schema, t.table_name
+    SELECT 
+        p.proname::text,
+        l.lanname::text,
+        pg_get_function_result(p.oid)::text,
+        pg_get_function_arguments(p.oid)::text,
+        pg_get_functiondef(p.oid)::text,
+        d.description::text
+    FROM pg_proc p
+    LEFT JOIN pg_language l ON p.prolang = l.oid
+    LEFT JOIN pg_description d ON p.oid = d.objoid
+    WHERE p.pronamespace = 'public'::regnamespace;
+$$;
+
+-- Function to get detailed table information
+CREATE OR REPLACE FUNCTION public.get_tables()
+RETURNS TABLE (
+    table_name text,
+    columns jsonb,
+    constraints jsonb,
+    foreign_keys jsonb,
+    indexes jsonb,
+    triggers jsonb,
+    policies jsonb
+)
+LANGUAGE sql
+SECURITY DEFINER
+AS $$
+    WITH table_list AS (
+        SELECT c.relname
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind = 'r'
     ),
-    function_info AS (
-        SELECT jsonb_agg(
-            jsonb_build_object(
-                'function_name', p.proname,
-                'language', l.lanname,
-                'return_type', pg_get_function_result(p.oid),
-                'argument_types', pg_get_function_arguments(p.oid),
-                'definition', pg_get_functiondef(p.oid),
-                'description', d.description
-            )
-        ) AS functions
-        FROM pg_proc p
-        JOIN pg_namespace n ON p.pronamespace = n.oid
-        JOIN pg_language l ON p.prolang = l.oid
-        LEFT JOIN pg_description d ON p.oid = d.objoid
-        WHERE n.nspname = 'public'
+    columns_info AS (
+        SELECT 
+            c.relname as table_name,
+            jsonb_object_agg(
+                a.attname,
+                jsonb_build_object(
+                    'data_type', format_type(a.atttypid, a.atttypmod),
+                    'is_nullable', CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END,
+                    'column_default', pg_get_expr(d.adbin, d.adrelid),
+                    'description', col_description(c.oid, a.attnum)
+                )
+            ) as columns
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+        LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+        WHERE n.nspname = 'public' AND c.relkind = 'r' AND a.attnum > 0
+        GROUP BY c.relname, c.oid
+    ),
+    constraints_info AS (
+        SELECT 
+            tc.table_name,
+            jsonb_object_agg(
+                tc.constraint_name,
+                jsonb_build_object(
+                    'constraint_type', tc.constraint_type,
+                    'definition', pg_get_constraintdef(pgc.oid)
+                )
+            ) as constraints
+        FROM information_schema.table_constraints tc
+        JOIN pg_constraint pgc ON tc.constraint_name = pgc.conname
+        WHERE tc.table_schema = 'public'
+        GROUP BY tc.table_name
+    ),
+    foreign_keys_info AS (
+        SELECT 
+            tc.table_name,
+            jsonb_object_agg(
+                tc.constraint_name,
+                jsonb_build_object(
+                    'column_name', kcu.column_name,
+                    'foreign_table_name', ccu.table_name,
+                    'foreign_column_name', ccu.column_name
+                )
+            ) as foreign_keys
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage ccu
+            ON ccu.constraint_name = tc.constraint_name
+            AND ccu.table_schema = tc.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+        GROUP BY tc.table_name
+    ),
+    indexes_info AS (
+        SELECT 
+            tablename as table_name,
+            jsonb_object_agg(
+                indexname,
+                jsonb_build_object(
+                    'indexdef', indexdef
+                )
+            ) as indexes
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+        GROUP BY tablename
+    ),
+    triggers_info AS (
+        SELECT 
+            event_object_table as table_name,
+            jsonb_object_agg(
+                trigger_name,
+                jsonb_build_object(
+                    'action_timing', action_timing,
+                    'event_manipulation', event_manipulation,
+                    'action_statement', action_statement
+                )
+            ) as triggers
+        FROM information_schema.triggers
+        WHERE trigger_schema = 'public'
+        GROUP BY event_object_table
+    ),
+    policies_info AS (
+        SELECT 
+            tablename as table_name,
+            jsonb_object_agg(
+                policyname,
+                jsonb_build_object(
+                    'command', cmd,
+                    'permissive', permissive,
+                    'roles', roles,
+                    'qual', qual,
+                    'with_check', with_check
+                )
+            ) as policies
+        FROM pg_policies
+        WHERE schemaname = 'public'
+        GROUP BY tablename
+    )
+    SELECT 
+        t.relname,
+        COALESCE(ci.columns, '{}'::jsonb),
+        COALESCE(con.constraints, '{}'::jsonb),
+        COALESCE(fk.foreign_keys, '{}'::jsonb),
+        COALESCE(i.indexes, '{}'::jsonb),
+        COALESCE(tr.triggers, '{}'::jsonb),
+        COALESCE(p.policies, '{}'::jsonb)
+    FROM table_list tl
+    JOIN pg_class t ON t.relname = tl.relname
+    LEFT JOIN columns_info ci ON ci.table_name = tl.relname
+    LEFT JOIN constraints_info con ON con.table_name = tl.relname
+    LEFT JOIN foreign_keys_info fk ON fk.table_name = tl.relname
+    LEFT JOIN indexes_info i ON i.table_name = tl.relname
+    LEFT JOIN triggers_info tr ON tr.table_name = tl.relname
+    LEFT JOIN policies_info p ON p.table_name = tl.relname;
+$$;
+
+-- Main function to get complete schema information
+CREATE OR REPLACE FUNCTION public.get_schema_info()
+RETURNS jsonb
+LANGUAGE sql
+SECURITY DEFINER
+AS $$
+    WITH view_definitions AS (
+        SELECT 
+            c.relname as view_name,
+            pg_get_viewdef(c.oid, true) as definition,
+            jsonb_object_agg(
+                a.attname,
+                jsonb_build_object(
+                    'data_type', format_type(a.atttypid, a.atttypmod),
+                    'description', col_description(c.oid, a.attnum)
+                )
+            ) as columns
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0
+        WHERE n.nspname = 'public' AND c.relkind = 'v'
+        GROUP BY c.relname, c.oid
     )
     SELECT jsonb_build_object(
-        'tables', COALESCE((
-            SELECT jsonb_agg(
-                jsonb_build_object(
-                    'table_name', table_name,
-                    'columns', COALESCE(columns, '[]'::jsonb),
-                    'foreign_keys', COALESCE(foreign_keys, '[]'::jsonb),
-                    'constraints', COALESCE(constraints, '[]'::jsonb),
-                    'indexes', COALESCE(indexes, '[]'::jsonb),
-                    'triggers', COALESCE(triggers, '[]'::jsonb),
-                    'policies', COALESCE(policies, '[]'::jsonb)
-                )
-            )
-            FROM table_info
-        ), '[]'::jsonb),
-        'functions', COALESCE((SELECT functions FROM function_info), '[]'::jsonb)
-    )
-    INTO result;
-
-    RETURN COALESCE(result, '{}'::jsonb);
-END;
+        'tables', COALESCE(
+            (SELECT jsonb_agg(to_jsonb(t)) FROM get_tables() t),
+            '[]'::jsonb
+        ),
+        'views', COALESCE(
+            (SELECT jsonb_agg(to_jsonb(v)) FROM view_definitions v),
+            '[]'::jsonb
+        ),
+        'functions', COALESCE(
+            (SELECT jsonb_agg(to_jsonb(f)) FROM get_functions() f),
+            '[]'::jsonb
+        )
+    );
 $$;
